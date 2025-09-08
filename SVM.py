@@ -60,11 +60,17 @@ class SVM:
         return y_mapped
     
     
-    def fit(self, X, y):
+    def fit(self, X, y, verbose=False):
         """
         X: (n_samples, n_features) numpy array
         y: array-like labels (two classes)
         """
+
+        if verbose:
+            solvers.options['show_progress'] = True
+        else:
+            solvers.options['show_progress'] = False
+
         X = np.asarray(X, dtype=float)
         y_in = np.asarray(y).ravel()
 
@@ -132,7 +138,10 @@ class SVM:
             for idx in sv_indices:
                 f_i = np.sum(alphas_all * y * K[:, idx])
                 b_vals.append(y[idx] - f_i)
-            self.b = np.mean(b_vals)
+            if len(b_vals) == 0:
+                self.b = 0.0
+            else:
+                self.b = np.mean(b_vals)
 
         # keep training-data-size alphas if needed (self.alphas already)
         return self
