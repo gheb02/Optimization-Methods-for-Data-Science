@@ -3,9 +3,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.optimize as opt
 from typing import List
+from scipy.optimize import minimize
 from scipy.stats import truncnorm
 from sklearn.model_selection import train_test_split, KFold
 import time
+import matplotlib.pyplot as plt
 
 
 def mape(y_real, y_pred):
@@ -16,10 +18,6 @@ def mape(y_real, y_pred):
     return np.mean(np.abs((y_real - y_pred) / (y_real + 1e-8))) * 100
     
 def dloss_dypred(y_real, y_pred):
-    """
-    y_real: true target values
-    y_pred: predicted values
-    """
     return (y_pred-y_real)/y_real.shape[0]
 
 def mae(y_real, y_pred):
@@ -31,18 +29,25 @@ def mae(y_real, y_pred):
 
 
 class NeuralNetwork:
-    def __init__(self, neurons: List, act='tanh', init=None, alpha=0.5):
+    def __init__(self, neurons: List, act='tanh', init=None, alpha=0.5, seed=None):
         """
         neurons: list with the number of neurons in each layer.
                       e.g. [512, 16, 8, 1]
         activation: string, 'tanh' or 'sigmoid'
-        init: string, 'glorot_unif', 'glorot_normal', 'he_unif', 'he_normal' or None
-        alpha: float
         """
         self.neurons = neurons
         self.layers = len(neurons) - 1  # number of layers (excluding input)
         self.act = act
         self.alpha = alpha
+
+        self.train_losses = []
+        self.val_losses = []
+        self.mae = []
+        self.mape = []
+
+        # Set seed
+        if seed is not None:
+            np.random.seed(seed)
 
         # Initialize weights and biases
         self.weights = []
@@ -77,17 +82,21 @@ class NeuralNetwork:
             b = np.zeros((1, out_dim))
             self.weights.append(W)
             self.biases.append(b)
+    
+        self.m_weights = [np.zeros_like(W) for W in self.weights]
+        self.v_weights = [np.zeros_like(W) for W in self.weights]
+        self.m_biases = [np.zeros_like(b) for b in self.biases]
+        self.v_biases = [np.zeros_like(b) for b in self.biases]
+
 
     def activation(self, x):
-        """
-        x: float
-        """
         if self.act == 'tanh':
             return np.tanh(x)
         elif self.act == 'sigmoid':
+            x = np.clip(x, -500, 500)  # to avoid overflow
             return 1 / (1 + np.exp(-x))
         else:
-            raise ValueError("Unsupported activation function")
+            raise ValueError("Unsupported activation function: Please select 'sigmoid' or 'tanh'")
         
     def derivate_activation(self, a):
         if self.act == 'tanh':
@@ -103,20 +112,19 @@ class NeuralNetwork:
             Output prediction of shape (n_samples, 1)
         """
         a = X
-        zs = []
         activations = [X]  # Store input as the first activation
         
-        for i in range(self.layers - 1):  # Hidden layers
+        # Hidden layers
+        for i in range(self.layers - 1):
             z = np.dot(a, self.weights[i]) + self.biases[i]
             a = self.activation(z)
-            zs.append(z)
             activations.append(a)
 
         # Output layer (no activation)
         output = np.dot(a, self.weights[-1]) + self.biases[-1]
-        zs.append(output)
         
-        return output, activations, zs
+        return output, activations
+
 
     def get_params_vector(self):
         """Returns all weights and biases flattened into a single vector."""
@@ -150,30 +158,26 @@ class NeuralNetwork:
         """
         y_real: true target values
         y_pred: predicted values
-        test: test MSE doesn't have regularization 
+        alpha: regularization parameter
         """
-        weights = self.weights
 
         loss = np.mean((y_real - y_pred)**2)/2
         if test:
             return loss
         else:
+            weights = self.weights
             reg = sum([np.sum(w**2) for w in weights])
             return loss + self.alpha * reg
     
     
     def backward(self, X, y):
-        """
-        Performs backpropagation
-
-        """
-        y_pred, activations, zs = self.forward(X)
+        y_pred, activations = self.forward(X)
         deltas = [None] * self.layers
         grads_W, grads_b = [], []
 
         # delta output layer
         dL_dy = dloss_dypred(y, y_pred)  # shape (batch, out_dim)
-        deltas[-1] = dL_dy  # ultimo layer: no activation
+        deltas[-1] = dL_dy  # last layer: no activation
 
         # hidden layers backwards
         for layer in reversed(range(self.layers - 1)):
@@ -197,18 +201,12 @@ class NeuralNetwork:
         grads_W: list of gradients for weights
         grads_b: list of gradients for biases
         lr: learning rate
-        method: "vanilla" or "adam"
+        method: "sgd" or "adam"
         beta1, beta2: Adam hyperparameters
         eps: numerical stability constant
         t: current timestep (needed for Adam bias correction)
         """
 
-        if not hasattr(self, "m_weights"):
-            # Initialize Adam moment estimates if not already done
-            self.m_weights = [np.zeros_like(W) for W in self.weights]
-            self.v_weights = [np.zeros_like(W) for W in self.weights]
-            self.m_biases = [np.zeros_like(b) for b in self.biases]
-            self.v_biases = [np.zeros_like(b) for b in self.biases]
 
         for i in range(self.layers):
             if method == "vanilla":
@@ -252,6 +250,8 @@ class NeuralNetwork:
 
         if method == "Mini Batch" and batch_size is None:
             raise ValueError("You must specify a batch_size for mini-batch training.")
+        if batch_size is not None:
+            method = "Mini Batch"
         
         if verbose:
             print('The model is initialized with the following hyperparameters:\n')
@@ -282,7 +282,7 @@ class NeuralNetwork:
             if method == "Batch":
                 X_batch, y_batch = X, y
 
-                y_pred, _, _ = self.forward(X_batch)
+                y_pred, _ = self.forward(X_batch)
                 loss = self.mse_loss(y_batch, y_pred)
 
                 grads_W, grads_b = self.backward(X_batch, y_batch)
@@ -290,6 +290,8 @@ class NeuralNetwork:
                 if verbose:
                     print(f"[Batch] Loss: {loss:.6f}")
                 t += 1
+
+                avg_loss = loss
 
             elif method == "SGD":
                 indices = np.random.permutation(len(X))
@@ -300,7 +302,7 @@ class NeuralNetwork:
                     xi = X_shuffled[i].reshape(1, -1)
                     yi = y_shuffled[i].reshape(1, -1)
 
-                    y_pred, _, _ = self.forward(xi)
+                    y_pred, _ = self.forward(xi)
                     loss = self.mse_loss(yi, y_pred)
 
                     grads_W, grads_b = self.backward(xi, yi)
@@ -317,33 +319,37 @@ class NeuralNetwork:
                 indices = np.random.permutation(len(X))
                 X_shuffled, y_shuffled = X[indices], y[indices]
 
+                X_batches = np.array_split(X_shuffled, np.ceil(len(X) / batch_size))
+                y_batches = np.array_split(y_shuffled, np.ceil(len(y) / batch_size))
+
                 total_loss = 0
-                num_batches = 0
 
-                for i in range(0, len(X_shuffled), batch_size):
-                    X_batch = X_shuffled[i:i+batch_size]
-                    y_batch = y_shuffled[i:i+batch_size]
-
-                    y_pred, _, _ = self.forward(X_batch)
+                for X_batch, y_batch in zip(X_batches, y_batches):
+                    y_pred, _ = self.forward(X_batch)
                     loss = self.mse_loss(y_batch, y_pred)
 
                     grads_W, grads_b = self.backward(X_batch, y_batch)
                     self.update(grads_W, grads_b, lr, method=optimizer, beta1=beta1, beta2=beta2, eps=eps, t=t)
 
                     total_loss += loss
-                    num_batches += 1
                     t += 1
 
-                avg_loss = total_loss / num_batches
+                avg_loss = total_loss / len(X_batches)
                 if verbose:
                     print(f"[Mini-batch] Average Loss: {avg_loss:.6f}")
 
-            # --- Validation & Early Stopping ---
+            self.train_losses.append(avg_loss)
+
+            # Validation and Early Stopping
             if X_val is not None and y_val is not None:
-                y_pred_val, _, _ = self.forward(X_val)
-                val_loss = self.mse_loss(y_val, y_pred_val)
+                y_pred_val, _ = self.forward(X_val)
+                val_loss = self.mse_loss(y_val, y_pred_val, test=True)
+                self.val_losses.append(val_loss)
                 val_mape = mape(y_val, y_pred_val)
                 val_mae = mae(y_val, y_pred_val)
+
+                self.mape.append(val_mape)
+                self.mae.append(val_mae)
                 if verbose:
                     print(f"Validation Loss: {val_loss:.6f} | Validation MAPE: {val_mape:.2f}% | Validation MAE: {val_mae:.2f} years")
 
@@ -353,11 +359,13 @@ class NeuralNetwork:
                         patience_counter = 0
                     else:  # no improvement
                         patience_counter += 1
-                        if patience_counter >= early_stopping:
+                        if patience_counter >= early_stopping and verbose:
                             print(f"\nEarly stopping triggered at epoch {epoch+1}!")
                             break
-                print(f"\nTraining completed!\nFinal training loss: {avg_loss:.6f}\nFinal validation loss: {val_loss:.6f} \nFinal validation MAPE: {val_mape:.2f}% \nFinal validation MAE: {val_mae:.2f}")
-            else:
+        if verbose and X_val is not None and y_val is not None:
+            print(f"\nTraining completed!\nFinal training loss: {avg_loss:.6f}\nFinal validation loss: {val_loss:.6f} \nFinal validation MAPE: {val_mape:.2f}% \nFinal validation MAE: {val_mae:.2f}")
+        else:
+            if verbose:
                 print(f"\nTraining completed!\nFinal training loss: {avg_loss:.6f}")
 
 
@@ -375,18 +383,19 @@ def test_model(nn, X_test, y_test):
         test_loss: MSE (with optional reg)
         test_mape: Mean Absolute Percentage Error
     """
-    y_pred, _, _ = nn.forward(X_test)
+    y_pred, _ = nn.forward(X_test)
+
+    # Ensure that in testing we don't use regularization
+    test = True
     
-    test_loss = nn.mse_loss(y_test, y_pred, test=True)
+    test_loss = nn.mse_loss(y_test, y_pred, test=test)
     test_mape = mape(y_test, y_pred)
     test_mae = mae(y_test, y_pred)
     
     print(f"Test Loss: {test_loss:.6f} | Test MAPE: {test_mape:.2f}% | Test MAE: {test_mae:.2f}")
-    
-    return test_loss, test_mape, test_mae
 
 
-def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early_stopping=10):
+def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early_stopping=10, seed=42):
     """
     Performs k-fold cross-validation on the training set, then evaluates on a fixed validation set.
 
@@ -401,6 +410,9 @@ def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early
         results: list of dicts with hyperparams + avg validation loss
         best_params: dict with best hyperparameters
     """
+
+    # Ensure that in cross-validation verbose is off and test is on
+    verbose, test = False, True
 
     kf = KFold(n_splits=k, shuffle=True, random_state=42)
     results = []
@@ -417,7 +429,7 @@ def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early
         print(f"Combination {comb+1}/{len(param_combinations)}")
         comb += 1
         print(f"\nEvaluating params: {params}")
-        fold_losses = []
+        fold_losses, fold_mae, fold_mape = [], [], []
 
         neurons = params.get("neurons", [X_train.shape[1], 32, 16, 1])
 
@@ -432,7 +444,8 @@ def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early
                 neurons,
                 act=params.get("activation", "tanh"),
                 init=params.get("init", None),
-                alpha=params.get("alpha", 0.0)
+                alpha=params.get("alpha", 0.0),
+                seed = seed
             )
 
             model.train(
@@ -444,26 +457,31 @@ def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early
                 X_val=X_fold_val, y_val=y_fold_val,
                 optimizer=params["optimizer"],
                 early_stopping=early_stopping,
-                verbose=False
+                verbose=verbose
             )
 
-            y_pred_val, _, _ = model.forward(X_fold_val)
-            val_loss = model.mse_loss(y_fold_val, y_pred_val)
+            y_pred_val, _ = model.forward(X_fold_val)
+            val_loss = model.mse_loss(y_fold_val, y_pred_val, test=test)
+            val_mae = mae(y_fold_val, y_pred_val)
+            val_mape = mape(y_fold_val, y_pred_val)
             fold_losses.append(val_loss)
+            fold_mae.append(val_mae)
+            fold_mape.append(val_mape)
+
 
         # average loss across folds
         avg_cv_loss = np.mean(fold_losses)
-        end = time.time()
-
-        total_time = end-start
-        print(f"\nTotal Validation Time: {total_time:.2f} seconds | Average Validation Time: {(total_time/len(param_combinations)):.2f}")
+        avg_cv_mae = np.mean(fold_mae)
+        avg_cv_mape = np.mean(fold_mape)
+        
 
         # retrain with full training set and evaluate on fixed validation set
         final_model = NeuralNetwork(
             neurons=params.get('neurons'),
             act=params.get("activation", "tanh"),
             init=params.get("init", None),
-            alpha=params.get("alpha", 0.0)
+            alpha=params.get("alpha", 0.0),
+            seed = seed
         )
         
         final_model.train(
@@ -475,19 +493,48 @@ def k_fold_cv(X_train, y_train, X_val, y_val, param_grid, k=5, epochs=200, early
             X_val=X_val, y_val=y_val,
             optimizer=params["optimizer"],
             early_stopping=early_stopping,
-            verbose=False
+            verbose=verbose
         )
 
-        y_pred_val, _, _ = final_model.forward(X_val)
-        fixed_val_loss = final_model.mse_loss(y_val, y_pred_val)
+        y_pred_val, _ = final_model.forward(X_val)
+        fixed_val_loss = final_model.mse_loss(y_val, y_pred_val, test=test)
+        fixed_val_mae = mae(y_val, y_pred_val)
+        fixed_val_mape = mape(y_val, y_pred_val)
 
-        print(f" Avg CV Loss: {avg_cv_loss:.6f} | Fixed Validation Loss: {fixed_val_loss:.6f}")
+        print(f"Avg CV Loss: {avg_cv_loss:.6f} | Fixed Validation Loss: {fixed_val_loss:.6f}")
+        print(f"Avg CV MAE:  {avg_cv_mae:.6f} | Fixed Validation MAE:  {fixed_val_mae:.6f}")
+        print(f"Avg CV MAPE: {avg_cv_mape:.6f} | Fixed Validation MAPE: {fixed_val_mape:.6f}")
 
-        results.append({**params, "cv_loss": avg_cv_loss, "val_loss": fixed_val_loss})
+        results.append({**params, "cv_loss": avg_cv_loss, "val_loss": fixed_val_loss, "cv_mae":avg_cv_mae, "val_mae":fixed_val_mae, "cv_mape":avg_cv_mape, "val_mape":fixed_val_mape})
+    
+
+    end = time.time()
+
+    total_time = end-start
+    print(f"\nTotal Validation Time: {total_time:.2f} seconds | Average Validation Time: {(total_time/len(param_combinations)):.2f} seconds")
 
     # Choose best params by fixed validation loss
     best_params = min(results, key=lambda x: x["val_loss"])
     print("\nBest Hyperparameters:", best_params)
 
+
     print(f"\nBest Validation Loss: {best_params['val_loss']:.4f}")
     return results, best_params
+
+
+# Obj function (loss) to minimize 
+def objective(theta, nn, X, y):
+    nn.set_params_vector(theta)
+    y_pred, _ = nn.forward(X)
+    return nn.mse_loss(y, y_pred)
+
+# Jacobian of the objective
+def objective_jac(theta, nn, X, y):
+    nn.set_params_vector(theta)
+    grads_W, grads_b = nn.backward(X, y)
+    # Flatten grads
+    grads = []
+    for gw, gb in zip(grads_W, grads_b):
+        grads.append(gw.flatten())
+        grads.append(gb.flatten())
+    return np.concatenate(grads)
