@@ -239,7 +239,7 @@ class NeuralNetwork:
 
     def train(self, X, y, lr, epochs=200, method="Batch", batch_size=None, 
           X_val=None, y_val=None, optimizer="vanilla", beta1=0.9, beta2=0.999, eps=1e-8,
-          early_stopping=None, verbose=True):
+          early_stopping=None, verbose=True, print_every=10):
 
         if method not in ["Batch", "Mini Batch", "SGD"]:
             raise ValueError('Select a method between: "Batch", "Mini Batch", and "SGD".')
@@ -247,7 +247,6 @@ class NeuralNetwork:
         if optimizer not in ["vanilla", "adam"]:
             raise ValueError('Select optimizer between: "vanilla" and "adam".')
         
-
         if method == "Mini Batch" and batch_size is None:
             raise ValueError("You must specify a batch_size for mini-batch training.")
         if batch_size is not None:
@@ -268,105 +267,103 @@ class NeuralNetwork:
                 print(f'    - Batch Size: {batch_size}')
             if early_stopping:
                 print(f'    - Early Stopping Patience: {early_stopping}')
-            
-
+                
         t = 1  # Adam time step
-
         best_val_loss = float("inf")
         patience_counter = 0
 
         for epoch in range(epochs):
-            if verbose:
-                print(f"\nEpoch {epoch + 1}/{epochs}")
 
+            # Training
             if method == "Batch":
                 X_batch, y_batch = X, y
-
                 y_pred, _ = self.forward(X_batch)
                 loss = self.mse_loss(y_batch, y_pred)
-
                 grads_W, grads_b = self.backward(X_batch, y_batch)
-                self.update(grads_W, grads_b, lr, method=optimizer, beta1=beta1, beta2=beta2, eps=eps, t=t)
-                if verbose:
-                    print(f"[Batch] Loss: {loss:.6f}")
-                t += 1
-
+                self.update(grads_W, grads_b, lr, method=optimizer,
+                            beta1=beta1, beta2=beta2, eps=eps, t=t)
                 avg_loss = loss
+                t += 1
 
             elif method == "SGD":
                 indices = np.random.permutation(len(X))
                 X_shuffled, y_shuffled = X[indices], y[indices]
-
-                total_loss = 0
+                total_loss = 0.0
                 for i in range(len(X_shuffled)):
                     xi = X_shuffled[i].reshape(1, -1)
                     yi = y_shuffled[i].reshape(1, -1)
-
                     y_pred, _ = self.forward(xi)
                     loss = self.mse_loss(yi, y_pred)
-
                     grads_W, grads_b = self.backward(xi, yi)
-                    self.update(grads_W, grads_b, lr, method=optimizer, beta1=beta1, beta2=beta2, eps=eps, t=t)
-
+                    self.update(grads_W, grads_b, lr, method=optimizer,
+                                beta1=beta1, beta2=beta2, eps=eps, t=t)
                     total_loss += loss
                     t += 1
-
                 avg_loss = total_loss / len(X_shuffled)
-                if verbose:
-                    print(f"[SGD] Average Loss: {avg_loss:.6f}")
 
             elif method == "Mini Batch":
                 indices = np.random.permutation(len(X))
                 X_shuffled, y_shuffled = X[indices], y[indices]
-
                 X_batches = np.array_split(X_shuffled, np.ceil(len(X) / batch_size))
                 y_batches = np.array_split(y_shuffled, np.ceil(len(y) / batch_size))
-
-                total_loss = 0
-
+                total_loss = 0.0
                 for X_batch, y_batch in zip(X_batches, y_batches):
                     y_pred, _ = self.forward(X_batch)
                     loss = self.mse_loss(y_batch, y_pred)
-
                     grads_W, grads_b = self.backward(X_batch, y_batch)
-                    self.update(grads_W, grads_b, lr, method=optimizer, beta1=beta1, beta2=beta2, eps=eps, t=t)
-
+                    self.update(grads_W, grads_b, lr, method=optimizer,
+                                beta1=beta1, beta2=beta2, eps=eps, t=t)
                     total_loss += loss
                     t += 1
-
                 avg_loss = total_loss / len(X_batches)
-                if verbose:
-                    print(f"[Mini-batch] Average Loss: {avg_loss:.6f}")
 
             self.train_losses.append(avg_loss)
 
-            # Validation and Early Stopping
+            # Validation
             if X_val is not None and y_val is not None:
                 y_pred_val, _ = self.forward(X_val)
                 val_loss = self.mse_loss(y_val, y_pred_val, test=True)
                 self.val_losses.append(val_loss)
                 val_mape = mape(y_val, y_pred_val)
                 val_mae = mae(y_val, y_pred_val)
-
                 self.mape.append(val_mape)
                 self.mae.append(val_mae)
-                if verbose:
-                    print(f"Validation Loss: {val_loss:.6f} | Validation MAPE: {val_mape:.2f}% | Validation MAE: {val_mae:.2f} years")
+            else:
+                val_loss, val_mape, val_mae = None, None, None
 
-                if early_stopping is not None:
-                    if val_loss < best_val_loss - 1e-6:  # improvement
-                        best_val_loss = val_loss
-                        patience_counter = 0
-                    else:  # no improvement
-                        patience_counter += 1
-                        if patience_counter >= early_stopping and verbose:
+            if verbose:
+                should_print = (
+                    epoch == 0 or
+                    epoch == epochs - 1 or
+                    (epoch + 1) % print_every == 0
+                )
+                if should_print:
+                    msg = f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.6f}"
+                    if val_loss is not None:
+                        msg += f" | Val Loss: {val_loss:.6f} | Val MAPE: {val_mape:.2f}% | Val MAE: {val_mae:.2f}"
+                    print(msg)
+
+            # Early stopping
+            if X_val is not None and y_val is not None and early_stopping is not None:
+                if val_loss < best_val_loss - 1e-6:  # improvement
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:  # no improvement
+                    patience_counter += 1
+                    if patience_counter >= early_stopping:
+                        if verbose:
+                            msg = f"Epoch {epoch+1}/{epochs} (early stopping) | Train Loss: {avg_loss:.6f}"
+                            msg += f" | Val Loss: {val_loss:.6f} | Val MAPE: {val_mape:.2f}% | Val MAE: {val_mae:.2f}"
+                            print(msg)
                             print(f"\nEarly stopping triggered at epoch {epoch+1}!")
-                            break
-        if verbose and X_val is not None and y_val is not None:
+                        break
+
+        if verbose and (X_val is not None and y_val is not None):
             print(f"\nTraining completed!\nFinal training loss: {avg_loss:.6f}\nFinal validation loss: {val_loss:.6f} \nFinal validation MAPE: {val_mape:.2f}% \nFinal validation MAE: {val_mae:.2f}")
         else:
             if verbose:
                 print(f"\nTraining completed!\nFinal training loss: {avg_loss:.6f}")
+
 
 
 def test_model(nn, X_test, y_test):
