@@ -71,6 +71,8 @@ class SVM:
         else:
             solvers.options['show_progress'] = False
 
+
+
         X = np.asarray(X, dtype=float)
         y_in = np.asarray(y).ravel()
 
@@ -171,88 +173,87 @@ class SVM:
 
     def get_support(self):
         return self.support_
-    
-    def fit_smo(self, X, y, tol=1e-3, max_passes=10, max_iter=10):
+
+    def fit_smo(self, X, y, tol=1e-5, max_passes=20, max_iter=1000, verbose=False):
+        """
+        SMO (MVP) training for binary SVM.
+        """
         X = np.asarray(X, dtype=float)
         y_in = np.asarray(y).ravel()
         y_enc = self.encode_labels(y_in)
         self.scaler = StandardScaler().fit(X)
         Xs = self.scaler.transform(X)
         n = y_enc.shape[0]
+
         alphas = np.zeros(n)
         b = 0.0
         passes = 0
         iteration = 0
+
         K = self.kernel(Xs)
 
         def f(i):
             return np.sum(alphas * y_enc * K[:, i]) + b
 
-        # Inizializza E in modo incrementale
+        # Incremental error cache
         E = np.array([f(i) - y_enc[i] for i in range(n)])
 
         while passes < max_passes and iteration < max_iter:
-            print(f"\n--- Iteration {iteration + 1}, consecutive passes without updates: {passes} ---")
             num_changed = 0
-            tested_pairs = np.zeros((n, n), dtype=bool)  # Uso di una matrice booleana per il controllo
 
             for i in range(n):
                 ei = E[i]
                 ai = alphas[i]
                 yi = y_enc[i]
 
-                # Controllo KKT
-                kkt_violation = ((ai < self.C and yi * ei < -tol) or (ai > 0 and yi * ei > tol))
-                if not kkt_violation:
+                eps = 1e-8  # tolleranza numerica
+
+                fi = f(i)
+
+                violates = (
+                    (ai < eps and yi * fi < 1 - tol) or
+                    (eps < ai < self.C - eps and abs(yi * fi - 1) > tol) or
+                    (ai > self.C - eps and yi * fi > 1 + tol)
+                )
+
+                if not violates:
                     continue
 
-                # Seleziona il secondo esempio in modo più efficiente
-                candidates = np.where(np.abs(E - ei) > 1e-3)[0]  # Seleziona solo quelli con errore significativo
-                candidates = candidates[candidates != i]  # Escludi il punto corrente
-
+                # Most violating pair selection (heuristic)
+                candidates = np.where((np.arange(n) != i) & (np.abs(E - ei) > 1e-5))[0]
                 if len(candidates) == 0:
                     continue
-
-                j = np.argmax(np.abs(E[candidates] - ei))  # Seleziona il punto con l'errore maggiore
-
-                # Se la coppia è già stata testata, salta
-                if tested_pairs[i, j]:
-                    continue
-                tested_pairs[i, j] = True
-                tested_pairs[j, i] = True  # Per evitare di testare di nuovo la stessa coppia (simmetria)
+                j = candidates[np.argmax(np.abs(E[candidates] - ei))]
 
                 aj = alphas[j]
                 yj = y_enc[j]
                 ej = E[j]
 
-                # Calcola i limiti L e H
+                # Compute bounds L and H
                 if yi != yj:
                     L = max(0, aj - ai)
                     H = min(self.C, self.C + aj - ai)
                 else:
                     L = max(0, ai + aj - self.C)
                     H = min(self.C, ai + aj)
-
                 if L == H:
                     continue
 
-                eta = 2 * K[i, j] - K[i, i] - K[j, j]
-                if eta >= 0:
+                # Correct eta
+                eta = K[i, i] + K[j, j] - 2 * K[i, j]
+                if eta <= 0:
                     continue
 
                 old_aj = aj
-                alphas[j] -= yj * (ei - ej) / eta
+                alphas[j] += yj * (ei - ej) / eta
                 alphas[j] = np.clip(alphas[j], L, H)
-
-                if abs(alphas[j] - old_aj) < 1e-5:
+                if abs(alphas[j] - old_aj) < 1e-12:
                     continue
-
                 alphas[i] += yi * yj * (old_aj - alphas[j])
 
-                # Aggiorna il bias b
+                # Update bias
                 b1 = b - ei - yi * (alphas[i] - ai) * K[i, i] - yj * (alphas[j] - old_aj) * K[i, j]
                 b2 = b - ej - yi * (alphas[i] - ai) * K[i, j] - yj * (alphas[j] - old_aj) * K[j, j]
-
                 if 0 < alphas[i] < self.C:
                     b = b1
                 elif 0 < alphas[j] < self.C:
@@ -260,12 +261,14 @@ class SVM:
                 else:
                     b = (b1 + b2) / 2
 
-                # Aggiorna l'errore
-                E = np.array([f(k) - y_enc[k] for k in range(n)])
+                # Incremental error update
+                E[i] = f(i) - yi
+                E[j] = f(j) - yj
+
                 num_changed += 1
 
-            
-            print(f"Number of alphas updated in this iteration: {num_changed}")
+            if verbose:
+                print(f"Iteration {iteration+1}, num_changed = {num_changed}, passes = {passes}")
 
             if num_changed == 0:
                 passes += 1
@@ -274,12 +277,27 @@ class SVM:
 
             iteration += 1
 
-        # Salva il modello finale
-        sv_mask = alphas > 1e-6
+        # Extract support vectors
+        sv_mask = alphas > 1e-8
         self.alpha_sv = alphas[sv_mask]
-        self.b = b
         self.X_sv = Xs[sv_mask]
         self.y_sv = y_enc[sv_mask]
+        # Calcolo più preciso del bias usando solo i support vector liberi
+        free_sv_mask = (alphas > tol) & (alphas < self.C - tol)
+        free_indices = np.where(free_sv_mask)[0]
 
-        print(f"\nTraining completed in {iteration} iterations. Total support vectors: {len(self.alpha_sv)}")
+        if len(free_indices) > 0:
+            b_vals = []
+            for i in free_indices:
+                f_i = np.sum(alphas * y_enc * K[:, i])
+                b_vals.append(y_enc[i] - f_i)
+            self.b = np.mean(b_vals)
+        else:
+            # Fallback: usa il valore di b dell’ultima iterazione
+            self.b = b
+
+
+        if verbose:
+            print(f"SMO finished in {iteration} iterations. Support vectors: {len(self.alpha_sv)}")
+
         return self
