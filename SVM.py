@@ -1,7 +1,14 @@
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+import pandas as pd
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+import seaborn as sns
 from cvxopt import matrix, solvers
-
+import matplotlib.pyplot as plt
+import time 
+from itertools import combinations
+from collections import defaultdict
 
 class SVM:
     def __init__(self, C=1.0, kernel='Gaussian', gamma=1, p=3,
@@ -13,7 +20,7 @@ class SVM:
         self.p = p
         self.tol = tol
 
-        # learned attributes
+        # learned parameters
         self.alphas = None        # all alpha (length n)
         self.support_ = None      # indices of support vectors
         self.X_sv = None
@@ -90,9 +97,7 @@ class SVM:
 
         # Build Q = (y y^T) * K
         Y = y.reshape(-1, 1)
-        Q = (Y @ Y.T) * K  # elementwise multiply
-        # numerical stabilizer: symmetrize & add tiny jitter
-        # Q = 0.5 * (Q + Q.T) + 1e-12 * np.eye(n_samples)
+        Q = (Y @ Y.T) * K 
 
         P = matrix(Q)                         # cvxopt matrix
         q = matrix(-np.ones((n_samples, 1)))  # minimize 1/2 a^T P a + q^T a -> q = -1
@@ -103,7 +108,7 @@ class SVM:
         G = matrix(G_std)
         h = matrix(h_std)
 
-        # equality A y = 0  (sum alpha_i y_i = 0)
+        # equality Ay = 0  (sum alpha_i y_i = 0)
         A = matrix(y.reshape(1, -1))
         b = matrix(0.0)
 
@@ -145,7 +150,6 @@ class SVM:
             else:
                 self.b = np.mean(b_vals)
 
-        # keep training-data-size alphas if needed (self.alphas already)
         return self
     
 
@@ -174,141 +178,354 @@ class SVM:
     def get_support(self):
         return self.support_
 
-    def fit_smo(self, X, y, tol=1e-3, max_passes=10, max_iter=1000, verbose=False):
-        
+    def fit_smo(self, X, y, tol=1e-5, max_passes=20, max_iter=1000, verbose=False):
+        """
+        SMO (MVP) training for binary SVM.
+        """
         X = np.asarray(X, dtype=float)
         y_in = np.asarray(y).ravel()
         y_enc = self.encode_labels(y_in)
-
         self.scaler = StandardScaler().fit(X)
         Xs = self.scaler.transform(X)
+        n = y_enc.shape[0]
 
-        n = Xs.shape[0]
-        C = float(self.C)
-        K = self.kernel(Xs)
-
-        alphas = np.zeros(n, dtype=float)
+        alphas = np.zeros(n)
         b = 0.0
+        passes = 0
+        iteration = 0
+
+        K = self.kernel(Xs)
 
         def f(i):
             return np.sum(alphas * y_enc * K[:, i]) + b
 
-        # initial E
-        E = np.array([f(i) - y_enc[i] for i in range(n)], dtype=float)
+        # Incremental error cache
+        E = np.array([f(i) - y_enc[i] for i in range(n)])
 
-        passes = 0
-        it = 0
-
-        if verbose:
-            print("Starting SMO (MVP) training...")
-
-        while passes < max_passes and it < max_iter:
+        while passes < max_passes and iteration < max_iter:
             num_changed = 0
-            it += 1
 
             for i in range(n):
-                Ai = alphas[i]
+                ei = E[i]
+                ai = alphas[i]
                 yi = y_enc[i]
-                Fi = f(i)
-                Ei = Fi - yi
 
-                # KKT check
-                violates = False
-                if (Ai < C - tol and yi * Fi < 1 - tol) or (Ai > tol and yi * Fi > 1 + tol):
-                    violates = True
+                eps = 1e-8  # Numerical tolerance
+
+                fi = f(i)
+
+                violates = (
+                    (ai < eps and yi * fi < 1 - tol) or
+                    (eps < ai < self.C - eps and abs(yi * fi - 1) > tol) or
+                    (ai > self.C - eps and yi * fi > 1 + tol)
+                )
 
                 if not violates:
                     continue
 
-                # MVP: pick j that maximizes |Ei - Ej|
-                abs_diff = np.abs(E - Ei)
-                abs_diff[i] = -1.0  # exclude i
-                j = int(np.argmax(abs_diff))
-                if abs_diff[j] < 1e-12:
-                    # fallback random j
-                    cand = list(range(n))
-                    cand.remove(i)
-                    j = np.random.choice(cand)
+                # Most violating pair selection
+                candidates = np.where((np.arange(n) != i) & (np.abs(E - ei) > 1e-5))[0]
+                if len(candidates) == 0:
+                    continue
+                j = candidates[np.argmax(np.abs(E[candidates] - ei))]
 
-                Aj_old = alphas[j]
+                aj = alphas[j]
                 yj = y_enc[j]
-                Ej = E[j]
+                ej = E[j]
 
-                # compute L and H
+                # Compute bounds L and H
                 if yi != yj:
-                    L = max(0.0, Aj_old - Ai)
-                    H = min(C, C + Aj_old - Ai)
+                    L = max(0, aj - ai)
+                    H = min(self.C, self.C + aj - ai)
                 else:
-                    L = max(0.0, Ai + Aj_old - C)
-                    H = min(C, Ai + Aj_old)
-
+                    L = max(0, ai + aj - self.C)
+                    H = min(self.C, ai + aj)
                 if L == H:
                     continue
 
-                Kii = K[i, i]
-                Kjj = K[j, j]
-                Kij = K[i, j]
-
-                eta = Kii + Kjj - 2.0 * Kij
-                if eta <= 1e-12:
+                eta = K[i, i] + K[j, j] - 2 * K[i, j]
+                if eta <= 0:
                     continue
 
-                # store previous values for incremental updates
-                prev_b = b
-                prev_Ai = Ai
-                prev_Aj = Aj_old
-
-                # analytic update
-                new_Aj = Aj_old + yj * (Ei - Ej) / eta
-                new_Aj = np.clip(new_Aj, L, H)
-                if abs(new_Aj - Aj_old) < 1e-8:
+                old_aj = aj
+                alphas[j] += yj * (ei - ej) / eta
+                alphas[j] = np.clip(alphas[j], L, H)
+                if abs(alphas[j] - old_aj) < 1e-12:
                     continue
+                alphas[i] += yi * yj * (old_aj - alphas[j])
 
-                new_Ai = Ai + yi * yj * (Aj_old - new_Aj)
-
-                alphas[i] = new_Ai
-                alphas[j] = new_Aj
-
-                # update b
-                b1 = prev_b - Ei - yi * (alphas[i] - prev_Ai) * Kii - yj * (alphas[j] - prev_Aj) * Kij
-                b2 = prev_b - Ej - yi * (alphas[i] - prev_Ai) * Kij - yj * (alphas[j] - prev_Aj) * Kjj
-
-                if 0 < alphas[i] < C:
+                # Update bias
+                b1 = b - ei - yi * (alphas[i] - ai) * K[i, i] - yj * (alphas[j] - old_aj) * K[i, j]
+                b2 = b - ej - yi * (alphas[i] - ai) * K[i, j] - yj * (alphas[j] - old_aj) * K[j, j]
+                if 0 < alphas[i] < self.C:
                     b = b1
-                elif 0 < alphas[j] < C:
+                elif 0 < alphas[j] < self.C:
                     b = b2
                 else:
-                    b = 0.5 * (b1 + b2)
+                    b = (b1 + b2) / 2
 
-                # incremental update of E for all k:
-                # E_k := E_k + (alphas[i] - prev_Ai) * yi * K[k,i] + (alphas[j] - prev_Aj) * yj * K[k,j] + (b - prev_b)
-                delta_ai = alphas[i] - prev_Ai
-                delta_aj = alphas[j] - prev_Aj
-                delta_b = b - prev_b
-
-                if abs(delta_ai) > 0 or abs(delta_aj) > 0 or abs(delta_b) > 0:
-                    E += delta_ai * yi * K[:, i] + delta_aj * yj * K[:, j] + delta_b
+                # Incremental error update
+                E[i] = f(i) - yi
+                E[j] = f(j) - yj
 
                 num_changed += 1
 
             if verbose:
-                print(f"Iteration {it}: num_changed = {num_changed}")
+                print(f"Iteration {iteration+1}, num_changed = {num_changed}, passes = {passes}")
 
             if num_changed == 0:
                 passes += 1
             else:
                 passes = 0
 
-        # finalize model storage
-        self.alphas = alphas.copy()
-        sv_mask = alphas > 1e-6
-        self.support_ = np.where(sv_mask)[0]
+            iteration += 1
+
+        # Extract support vectors
+        sv_mask = alphas > 1e-8
         self.alpha_sv = alphas[sv_mask]
         self.X_sv = Xs[sv_mask]
         self.y_sv = y_enc[sv_mask]
-        self.b = b
+
+        free_sv_mask = (alphas > tol) & (alphas < self.C - tol)
+        free_indices = np.where(free_sv_mask)[0]
+
+        if len(free_indices) > 0:
+            b_vals = []
+            for i in free_indices:
+                f_i = np.sum(alphas * y_enc * K[:, i])
+                b_vals.append(y_enc[i] - f_i)
+            self.b = np.mean(b_vals)
+        else:
+            # Fallback
+            self.b = b
+        
+        obj_val = np.sum(alphas) - 0.5 * np.sum(
+        np.outer(alphas * y_enc, alphas * y_enc) * K
+        )
+
+        self.alphas = alphas.copy()
 
         if verbose:
-            print(f"SMO finished in {it} iterations. Support vectors: {len(self.alpha_sv)}")
+            print(f"SMO finished in {iteration} iterations. Support vectors: {len(self.alpha_sv)}")
+            print(f"Final value of the dual SVM objective: {obj_val:.6f}")
 
         return self
+    
+    def optimality_gap(self, X, y):
+        """
+        Compute final difference m(lambda) - M(lambda).
+        """
+        # ensure labels are mapped
+        y_enc = self.encode_labels(y)
+
+        # decision values for training set
+        scores = self.decision_function(X)
+
+        # gradient of dual: g_i = 1 - y_i f(x_i)
+        g = 1 - y_enc * scores
+
+        # apply projected gradient rules
+        proj_grad = np.zeros_like(g)
+        for i in range(len(g)):
+            if 0 < self.alphas[i] < self.C:
+                proj_grad[i] = g[i]
+            elif self.alphas[i] <= self.tol:
+                proj_grad[i] = min(0, g[i])
+            elif self.alphas[i] >= self.C - self.tol:
+                proj_grad[i] = max(0, g[i])
+
+        # m = max over allowed gradients, M = min over allowed gradients
+        m_val = np.max(proj_grad)
+        M_val = np.min(proj_grad)
+
+        return m_val - M_val
+
+
+class MultiSVM(SVM):
+    def __init__(self, method="OvR", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.method = method
+        self.models = {}  # Dict for OvR, list for OvO
+        self.pair_classes = []  
+        self.classes = None
+        self.binary_model = None
+
+    def fit(self, X, y, verbose=False):
+        classes = np.unique(y)
+        if self.method not in ["OvO", "OvR"]:
+            raise ValueError('Please select "OvO" or "OvR"')
+
+        if len(classes) < 2:
+            raise ValueError("Please select 2 or more classes")
+
+        self.classes = np.array(classes)
+
+        if len(classes) == 2:
+            self.binary_model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+            self.binary_model.fit(X, y, verbose=verbose)
+        elif len(classes) >= 3 and self.method == "OvR":
+            self.models = {}  # dict
+            for cls in classes:
+                y_bin = np.where(y == cls, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit(X, y_bin, verbose=verbose)
+                self.models[cls] = model
+        elif len(classes) >= 3 and self.method == "OvO":
+            self.models = []  # models list
+            self.pair_classes = []
+            for cls1, cls2 in combinations(self.classes, 2):
+                idx = np.where((y == cls1) | (y == cls2))[0]
+                X_pair = X[idx]
+                y_pair = y[idx]
+                y_bin = np.where(y_pair == cls1, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit(X_pair, y_bin, verbose=verbose)
+                self.models.append(model)
+                self.pair_classes.append((cls1, cls2))
+        return self
+
+    def fit_smo(self, X, y, max_iter=10, verbose=False):
+        classes = np.unique(y)
+        if self.method not in ["OvO", "OvR"]:
+            raise ValueError('Please select "OvO" or "OvR"')
+
+        if len(classes) < 2:
+            raise ValueError("Please select 2 or more classes")
+
+        self.classes = np.array(classes)
+
+        if len(classes) == 2:
+            self.binary_model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+            self.binary_model.fit_smo(X, y, max_iter=max_iter, verbose=verbose)
+        elif len(classes) >= 3 and self.method == "OvR":
+            self.models = {}
+            for cls in classes:
+                y_bin = np.where(y == cls, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit_smo(X, y_bin, max_iter=max_iter, verbose=verbose)
+                self.models[cls] = model
+        elif len(classes) >= 3 and self.method == "OvO":
+            self.models = []
+            self.pair_classes = []
+            for cls1, cls2 in combinations(self.classes, 2):
+                idx = np.where((y == cls1) | (y == cls2))[0]
+                X_pair = X[idx]
+                y_pair = y[idx]
+                y_bin = np.where(y_pair == cls1, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit_smo(X_pair, y_bin, max_iter=max_iter, verbose=verbose)
+                self.models.append(model)
+                self.pair_classes.append((cls1, cls2))
+        return self
+
+    def predict(self, X):
+        if len(self.classes) == 2:
+            return self.binary_model.predict(X)
+        elif len(self.classes) >= 3 and self.method == "OvR":
+            scores = np.column_stack([self.models[cls].decision_function(X) for cls in self.classes])
+            idx = np.argmax(scores, axis=1)
+            return self.classes[idx]
+        elif len(self.classes) >= 3 and self.method == "OvO":
+            votes = np.zeros((X.shape[0], len(self.classes)), dtype=int)
+            for model, (cls1, cls2) in zip(self.models, self.pair_classes):
+                pred = model.predict(X)
+                for i, p in enumerate(pred):
+                    if p == 1:
+                        votes[i, np.where(self.classes == cls1)[0][0]] += 1
+                    else:
+                        votes[i, np.where(self.classes == cls2)[0][0]] += 1
+            return self.classes[np.argmax(votes, axis=1)]
+
+
+
+
+def grid_search_cv(X, y, C_grid, gamma_grid=None, degree_grid=None,
+                   k=5, random_state=0, smo=False, max_iter=10):
+    """
+    Grid search for Gaussian and Polynomial SVM with k-fold CV.
+    Returns: best_params, best_score, all_results (list of dicts)
+    """
+
+
+    y = np.asarray(y).ravel()
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+
+    best_score = -np.inf
+    best_params = {}
+    all_results = []
+
+
+    if not smo:
+        for C in C_grid:
+            # Gaussian kernel
+            if gamma_grid:
+                for gamma in gamma_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Gaussian', gamma=gamma)
+                        model.fit(X[train_idx], y[train_idx])
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Gaussian', 'C': C, 'gamma': gamma,
+                        'mean_score': mean_score
+                    })
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'gamma': gamma, 'kernel': 'Gaussian'}
+
+            # Polynomial kernel
+            if degree_grid:
+                for degree in degree_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Polynomial', p=degree)
+                        model.fit(X[train_idx], y[train_idx])
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Polynomial', 'C': C, 'degree': degree,
+                        'mean_score': mean_score
+                    })
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'degree': degree, 'kernel': 'Polynomial'}
+    else:
+        for C in C_grid:
+            # Gaussian kernel
+            if gamma_grid:
+                for gamma in gamma_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Gaussian', gamma=gamma)
+                        model.fit_smo(X[train_idx], y[train_idx], max_iter=max_iter)
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Gaussian', 'C': C, 'gamma': gamma,
+                        'mean_score': mean_score})
+                    print(f"Trying C={C}, gamma={gamma} -> mean score={mean_score:.4f}")
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'gamma': gamma, 'kernel': 'Gaussian'}
+
+            # Polynomial kernel
+            if degree_grid:
+                for degree in degree_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Polynomial', p=degree)
+                        model.fit_smo(X[train_idx], y[train_idx], max_iter=max_iter)
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Polynomial', 'C': C, 'degree': degree,
+                        'mean_score': mean_score})
+                    print(f"Trying C={C}, degree={degree} -> mean score={mean_score:.4f}")
+
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'degree': degree, 'kernel': 'Polynomial'}
+
+    print(best_params, best_score)
+    return best_params, best_score, all_results
