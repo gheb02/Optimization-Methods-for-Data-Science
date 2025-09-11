@@ -298,12 +298,47 @@ class SVM:
         else:
             # Fallback: usa il valore di b dell’ultima iterazione
             self.b = b
+        
+        obj_val = np.sum(alphas) - 0.5 * np.sum(
+        np.outer(alphas * y_enc, alphas * y_enc) * K
+        )
 
+        self.alphas = alphas.copy()
 
         if verbose:
             print(f"SMO finished in {iteration} iterations. Support vectors: {len(self.alpha_sv)}")
+            print(f"Final value of the dual SVM objective: {obj_val:.6f}")
 
         return self
+    
+    def optimality_gap(self, X, y):
+        """
+        Compute final difference m(lambda) - M(lambda).
+        """
+        # ensure labels are mapped
+        y_enc = self.encode_labels(y)
+
+        # decision values for training set
+        scores = self.decision_function(X)
+
+        # gradient of dual: g_i = 1 - y_i f(x_i)
+        g = 1 - y_enc * scores
+
+        # apply projected gradient rules
+        proj_grad = np.zeros_like(g)
+        for i in range(len(g)):
+            if 0 < self.alphas[i] < self.C:
+                proj_grad[i] = g[i]
+            elif self.alphas[i] <= self.tol:
+                proj_grad[i] = min(0, g[i])
+            elif self.alphas[i] >= self.C - self.tol:
+                proj_grad[i] = max(0, g[i])
+
+        # m = max over allowed gradients, M = min over allowed gradients
+        m_val = np.max(proj_grad)
+        M_val = np.min(proj_grad)
+
+        return m_val - M_val
 
 
 class MultiSVM(SVM):
