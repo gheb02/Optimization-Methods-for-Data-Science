@@ -1,6 +1,9 @@
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from cvxopt import matrix, solvers
+from sklearn.model_selection import StratifiedKFold
+from itertools import combinations  
+
 
 
 class SVM:
@@ -301,3 +304,193 @@ class SVM:
             print(f"SMO finished in {iteration} iterations. Support vectors: {len(self.alpha_sv)}")
 
         return self
+
+
+class MultiSVM(SVM):
+    def __init__(self, method="OvR", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.method = method
+        self.models = {}  # dict per OvR, sarà sovrascritto se OvO
+        self.pair_classes = []  # usata solo in OvO
+        self.classes = None
+        self.binary_model = None
+
+    def fit(self, X, y, verbose=False):
+        classes = np.unique(y)
+        if self.method not in ["OvO", "OvR"]:
+            raise ValueError('Please select "OvO" or "OvR"')
+
+        if len(classes) < 2:
+            raise ValueError("Please select 2 or more classes")
+
+        self.classes = np.array(classes)
+
+        if len(classes) == 2:
+            self.binary_model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+            self.binary_model.fit(X, y, verbose=verbose)
+        elif len(classes) >= 3 and self.method == "OvR":
+            self.models = {}  # dict
+            for cls in classes:
+                y_bin = np.where(y == cls, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit(X, y_bin, verbose=verbose)
+                self.models[cls] = model
+        elif len(classes) >= 3 and self.method == "OvO":
+            self.models = []  # lista per modelli
+            self.pair_classes = []
+            for cls1, cls2 in combinations(self.classes, 2):
+                idx = np.where((y == cls1) | (y == cls2))[0]
+                X_pair = X[idx]
+                y_pair = y[idx]
+                y_bin = np.where(y_pair == cls1, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit(X_pair, y_bin, verbose=verbose)
+                self.models.append(model)
+                self.pair_classes.append((cls1, cls2))
+        return self
+
+    def fit_smo(self, X, y, max_iter=10, verbose=False):
+        classes = np.unique(y)
+        if self.method not in ["OvO", "OvR"]:
+            raise ValueError('Please select "OvO" or "OvR"')
+
+        if len(classes) < 2:
+            raise ValueError("Please select 2 or more classes")
+
+        self.classes = np.array(classes)
+
+        if len(classes) == 2:
+            self.binary_model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+            self.binary_model.fit_smo(X, y, max_iter=max_iter, verbose=verbose)
+        elif len(classes) >= 3 and self.method == "OvR":
+            self.models = {}
+            for cls in classes:
+                y_bin = np.where(y == cls, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit_smo(X, y_bin, max_iter=max_iter, verbose=verbose)
+                self.models[cls] = model
+        elif len(classes) >= 3 and self.method == "OvO":
+            self.models = []
+            self.pair_classes = []
+            for cls1, cls2 in combinations(self.classes, 2):
+                idx = np.where((y == cls1) | (y == cls2))[0]
+                X_pair = X[idx]
+                y_pair = y[idx]
+                y_bin = np.where(y_pair == cls1, 1, -1)
+                model = SVM(C=self.C, kernel=self.kernel_type, gamma=self.gamma, p=self.p, tol=self.tol)
+                model.fit_smo(X_pair, y_bin, max_iter=max_iter, verbose=verbose)
+                self.models.append(model)
+                self.pair_classes.append((cls1, cls2))
+        return self
+
+    def predict(self, X):
+        if len(self.classes) == 2:
+            return self.binary_model.predict(X)
+        elif len(self.classes) >= 3 and self.method == "OvR":
+            scores = np.column_stack([self.models[cls].decision_function(X) for cls in self.classes])
+            idx = np.argmax(scores, axis=1)
+            return self.classes[idx]
+        elif len(self.classes) >= 3 and self.method == "OvO":
+            votes = np.zeros((X.shape[0], len(self.classes)), dtype=int)
+            for model, (cls1, cls2) in zip(self.models, self.pair_classes):
+                pred = model.predict(X)
+                for i, p in enumerate(pred):
+                    if p == 1:
+                        votes[i, np.where(self.classes == cls1)[0][0]] += 1
+                    else:
+                        votes[i, np.where(self.classes == cls2)[0][0]] += 1
+            return self.classes[np.argmax(votes, axis=1)]
+
+
+
+
+def grid_search_cv(X, y, C_grid, gamma_grid=None, degree_grid=None,
+                   k=5, random_state=0, smo=False, max_iter=10):
+    """
+    Grid search for Gaussian and Polynomial SVM with k-fold CV.
+    Returns: best_params, best_score, all_results (list of dicts)
+    """
+
+
+    y = np.asarray(y).ravel()
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=random_state)
+
+    best_score = -np.inf
+    best_params = {}
+    all_results = []
+
+
+    if not smo:
+        for C in C_grid:
+            # --- Gaussian kernel ---
+            if gamma_grid:
+                for gamma in gamma_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Gaussian', gamma=gamma)
+                        model.fit(X[train_idx], y[train_idx])
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Gaussian', 'C': C, 'gamma': gamma,
+                        'mean_score': mean_score
+                    })
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'gamma': gamma, 'kernel': 'Gaussian'}
+
+            # --- Polynomial kernel ---
+            if degree_grid:
+                for degree in degree_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Polynomial', p=degree)
+                        model.fit(X[train_idx], y[train_idx])
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Polynomial', 'C': C, 'degree': degree,
+                        'mean_score': mean_score
+                    })
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'degree': degree, 'kernel': 'Polynomial'}
+    else:
+        for C in C_grid:
+            # --- Gaussian kernel ---
+            if gamma_grid:
+                for gamma in gamma_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Gaussian', gamma=gamma)
+                        model.fit_smo(X[train_idx], y[train_idx], max_iter=max_iter)
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Gaussian', 'C': C, 'gamma': gamma,
+                        'mean_score': mean_score})
+                    print(f"Trying C={C}, gamma={gamma} -> mean score={mean_score:.4f}")
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'gamma': gamma, 'kernel': 'Gaussian'}
+
+            # --- Polynomial kernel ---
+            if degree_grid:
+                for degree in degree_grid:
+                    scores = []
+                    for train_idx, val_idx in skf.split(X, y):
+                        model = SVM(C=C, kernel='Polynomial', p=degree)
+                        model.fit_smo(X[train_idx], y[train_idx], max_iter=max_iter)
+                        scores.append(model.score(X[val_idx], y[val_idx]))
+                    mean_score = np.mean(scores)
+                    all_results.append({
+                        'kernel': 'Polynomial', 'C': C, 'degree': degree,
+                        'mean_score': mean_score})
+                    print(f"Trying C={C}, degree={degree} -> mean score={mean_score:.4f}")
+
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_params = {'C': C, 'degree': degree, 'kernel': 'Polynomial'}
+
+    print(best_params, best_score)
+    return best_params, best_score, all_results
